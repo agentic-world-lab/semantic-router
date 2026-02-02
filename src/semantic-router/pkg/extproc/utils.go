@@ -13,9 +13,121 @@ import (
 
 // sendResponse sends a response with proper error handling and logging
 func sendResponse(stream ext_proc.ExternalProcessor_ProcessServer, response *ext_proc.ProcessingResponse, msgType string) error {
-	logging.Debugf("Processing at stage [%s]: %+v", msgType, response)
+	// Log detailed response information being sent back to AgentGateway
+	logging.Infof("[RESPONSE-SEND] ========== Sending %s Response to AgentGateway ==========", msgType)
+	logging.Infof("[RESPONSE-SEND] Response type: %T", response.Response)
 
-	// Debug: dump response structure if needed
+	switch v := response.Response.(type) {
+	case *ext_proc.ProcessingResponse_RequestHeaders:
+		logging.Infof("[RESPONSE-SEND] RequestHeaders Response:")
+		if v.RequestHeaders != nil && v.RequestHeaders.Response != nil {
+			logging.Infof("[RESPONSE-SEND]   Status: %v", v.RequestHeaders.Response.Status)
+			if v.RequestHeaders.Response.HeaderMutation != nil {
+				hm := v.RequestHeaders.Response.HeaderMutation
+				if len(hm.SetHeaders) > 0 {
+					logging.Infof("[RESPONSE-SEND]   Setting %d headers:", len(hm.SetHeaders))
+					for _, h := range hm.SetHeaders {
+						if h.Header != nil {
+							logging.Infof("[RESPONSE-SEND]     - %s: %s", h.Header.Key, h.Header.Value)
+						}
+					}
+				}
+				if len(hm.RemoveHeaders) > 0 {
+					logging.Infof("[RESPONSE-SEND]   Removing %d headers: %v", len(hm.RemoveHeaders), hm.RemoveHeaders)
+				}
+			}
+		}
+
+	case *ext_proc.ProcessingResponse_RequestBody:
+		logging.Infof("[RESPONSE-SEND] RequestBody Response:")
+		if v.RequestBody != nil && v.RequestBody.Response != nil {
+			logging.Infof("[RESPONSE-SEND]   Status: %v", v.RequestBody.Response.Status)
+			if v.RequestBody.Response.BodyMutation != nil {
+				bm := v.RequestBody.Response.BodyMutation
+				switch bm.Mutation.(type) {
+				case *ext_proc.BodyMutation_Body:
+					if body := bm.GetBody(); body != nil {
+						logging.Infof("[RESPONSE-SEND]   Body mutation (regular): %d bytes", len(body))
+						logging.Infof("[RESPONSE-SEND]   Modified body: %s", string(body))
+					}
+				case *ext_proc.BodyMutation_StreamedResponse:
+					if sr := bm.GetStreamedResponse(); sr != nil {
+						logging.Infof("[RESPONSE-SEND]   Body mutation (streamed): %d bytes, EndOfStream=%v", len(sr.Body), sr.EndOfStream)
+						logging.Infof("[RESPONSE-SEND]   Modified body: %s", string(sr.Body))
+					}
+				default:
+					logging.Infof("[RESPONSE-SEND]   Body mutation present (unknown type)")
+				}
+			}
+			if v.RequestBody.Response.HeaderMutation != nil {
+				hm := v.RequestBody.Response.HeaderMutation
+				if len(hm.SetHeaders) > 0 {
+					logging.Infof("[RESPONSE-SEND]   Setting %d headers:", len(hm.SetHeaders))
+					for _, h := range hm.SetHeaders {
+						if h.Header != nil {
+							logging.Infof("[RESPONSE-SEND]     - %s: %s", h.Header.Key, h.Header.Value)
+						}
+					}
+				}
+				if len(hm.RemoveHeaders) > 0 {
+					logging.Infof("[RESPONSE-SEND]   Removing %d headers: %v", len(hm.RemoveHeaders), hm.RemoveHeaders)
+				}
+			}
+		}
+
+	case *ext_proc.ProcessingResponse_ResponseHeaders:
+		logging.Infof("[RESPONSE-SEND] ResponseHeaders Response:")
+		if v.ResponseHeaders != nil && v.ResponseHeaders.Response != nil {
+			logging.Infof("[RESPONSE-SEND]   Status: %v", v.ResponseHeaders.Response.Status)
+			if v.ResponseHeaders.Response.HeaderMutation != nil {
+				hm := v.ResponseHeaders.Response.HeaderMutation
+				if len(hm.SetHeaders) > 0 {
+					logging.Infof("[RESPONSE-SEND]   Setting %d headers:", len(hm.SetHeaders))
+					for _, h := range hm.SetHeaders {
+						if h.Header != nil {
+							logging.Infof("[RESPONSE-SEND]     - %s: %s", h.Header.Key, h.Header.Value)
+						}
+					}
+				}
+			}
+		}
+
+	case *ext_proc.ProcessingResponse_ResponseBody:
+		logging.Infof("[RESPONSE-SEND] ResponseBody Response:")
+		if v.ResponseBody != nil && v.ResponseBody.Response != nil {
+			logging.Infof("[RESPONSE-SEND]   Status: %v", v.ResponseBody.Response.Status)
+			if v.ResponseBody.Response.BodyMutation != nil {
+				logging.Infof("[RESPONSE-SEND]   Body mutation present")
+			}
+		}
+
+	case *ext_proc.ProcessingResponse_ImmediateResponse:
+		logging.Infof("[RESPONSE-SEND] ImmediateResponse:")
+		if v.ImmediateResponse != nil {
+			if v.ImmediateResponse.Status != nil {
+				logging.Infof("[RESPONSE-SEND]   Status Code: %v", v.ImmediateResponse.Status.Code)
+			}
+			logging.Infof("[RESPONSE-SEND]   Body size: %d bytes", len(v.ImmediateResponse.Body))
+			if len(v.ImmediateResponse.Body) > 0 {
+				logging.Infof("[RESPONSE-SEND]   Body: %s", string(v.ImmediateResponse.Body))
+			}
+			if v.ImmediateResponse.Headers != nil && len(v.ImmediateResponse.Headers.SetHeaders) > 0 {
+				logging.Infof("[RESPONSE-SEND]   Headers (%d):", len(v.ImmediateResponse.Headers.SetHeaders))
+				for _, h := range v.ImmediateResponse.Headers.SetHeaders {
+					if h.Header != nil {
+						logging.Infof("[RESPONSE-SEND]     - %s: %s", h.Header.Key, h.Header.Value)
+					}
+				}
+			}
+		}
+
+	default:
+		logging.Infof("[RESPONSE-SEND] Unknown response type: %T", v)
+	}
+
+	logging.Infof("[RESPONSE-SEND] ========== Response Ready to Send ==========")
+
+	// Send response
 	if err := stream.Send(response); err != nil {
 		logging.Errorf("Error sending %s response: %v", msgType, err)
 		return err

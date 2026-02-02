@@ -84,10 +84,23 @@ func (r *OpenAIRouter) Process(stream ext_proc.ExternalProcessor_ProcessServer) 
 				return err
 			}
 			logging.Infof("Modified request body: %+v", response)
+			logging.Infof("[PROCESSOR_CORE] ========== About to send request body response ==========")
+			logging.Infof("[PROCESSOR_CORE] Response type: %T", response.Response)
+			if rb, ok := response.Response.(*ext_proc.ProcessingResponse_RequestBody); ok && rb != nil && rb.RequestBody != nil && rb.RequestBody.Response != nil {
+				if hm := rb.RequestBody.Response.HeaderMutation; hm != nil && len(hm.SetHeaders) > 0 {
+					logging.Infof("[PROCESSOR_CORE] Headers to be set: %d", len(hm.SetHeaders))
+					for _, h := range hm.SetHeaders {
+						if h.Header != nil {
+							logging.Infof("[PROCESSOR_CORE]   Header: %s = %s", h.Header.Key, h.Header.Value)
+						}
+					}
+				}
+			}
 			if err := sendResponse(stream, response, "request body"); err != nil {
 				logging.Errorf("sendResponse for body failed: %v", err)
 				return err
 			}
+			logging.Infof("[PROCESSOR_CORE] Response sent successfully")
 
 		case *ext_proc.ProcessingRequest_ResponseHeaders:
 			response, err := r.handleResponseHeaders(v, ctx)

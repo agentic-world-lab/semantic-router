@@ -23,7 +23,12 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 	// Decrement active request count for queue depth estimation
 	defer metrics.DecrementModelActiveRequests(ctx.RequestModel)
 
-	// If this is a looper internal request, skip all processing and just continue
+	// Store original incoming body for forwarding in FULL_DUPLEX_STREAMED mode
+	// This is important: we forward the original chunk, not the reconstructed response
+	originalResponseBody := v.ResponseBody.Body
+	endOfStream := v.ResponseBody.GetEndOfStream()
+
+	// If this is a looper internal request, skip all processing and forward the body
 	// The response will be handled by the looper client directly
 	if ctx.LooperRequest {
 		logging.Debugf("[Looper] Skipping response body processing for internal request")
@@ -32,6 +37,14 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 				ResponseBody: &ext_proc.BodyResponse{
 					Response: &ext_proc.CommonResponse{
 						Status: ext_proc.CommonResponse_CONTINUE,
+						BodyMutation: &ext_proc.BodyMutation{
+							Mutation: &ext_proc.BodyMutation_StreamedResponse{
+								StreamedResponse: &ext_proc.StreamedBodyResponse{
+									Body:        originalResponseBody,
+									EndOfStream: endOfStream,
+								},
+							},
+						},
 					},
 				},
 			},
@@ -40,6 +53,40 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 
 	// Process the response for caching
 	responseBody := v.ResponseBody.Body
+
+	logging.Infof("[RESPONSE_BODY] Processing response body: IsStreamingResponse=%v, bodyLen=%d, EndOfStream=%v, body=%s",
+		ctx.IsStreamingResponse, len(responseBody), v.ResponseBody.GetEndOfStream(), string(responseBody))
+
+	// Handle chunked non-streaming responses in FULL_DUPLEX_STREAMED mode
+	// Non-streaming responses with transfer-encoding: chunked may arrive in multiple chunks
+	// For intermediate chunks, we forward them as-is to the client
+	// For the final chunk, we reconstruct the complete response for token parsing
+	if !ctx.IsStreamingResponse && v.ResponseBody.GetEndOfStream() {
+		// This is the final chunk (EndOfStream=true) - reconstruct complete response from accumulated chunks if any
+		if ctx.StreamingResponseChunks != nil && len(ctx.StreamingResponseChunks) > 0 {
+			// Add the final chunk to accumulation (may be empty)
+			ctx.StreamingResponseChunks = append(ctx.StreamingResponseChunks, responseBody)
+
+			// Combine all chunks for JSON parsing
+			var combined []byte
+			for _, chunk := range ctx.StreamingResponseChunks {
+				combined = append(combined, chunk...)
+			}
+			responseBody = combined
+			logging.Infof("[RESPONSE_CHUNK] Reconstructed complete response from %d chunks, total size: %d bytes",
+				len(ctx.StreamingResponseChunks), len(responseBody))
+			ctx.StreamingResponseChunks = nil // Clear for potential reuse
+		}
+	} else if !ctx.IsStreamingResponse && len(responseBody) > 0 && !v.ResponseBody.GetEndOfStream() {
+		// Intermediate chunk - accumulate for later reconstruction
+		if ctx.StreamingResponseChunks == nil {
+			ctx.StreamingResponseChunks = make([][]byte, 0)
+		}
+		ctx.StreamingResponseChunks = append(ctx.StreamingResponseChunks, responseBody)
+		logging.Infof("[RESPONSE_CHUNK] Accumulated non-streaming response chunk: %d bytes, total chunks: %d",
+			len(responseBody), len(ctx.StreamingResponseChunks))
+		// Continue processing to forward the chunk to client
+	}
 
 	// Transform Anthropic API response to OpenAI format if this is an Anthropic-routed request
 	anthropicTransformed := false
@@ -104,12 +151,20 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 			r.attachRouterReplayResponse(ctx, replayPayload, true)
 		}
 
-		// For streaming chunks, just continue (chunks are forwarded immediately)
+		// For streaming chunks, forward using StreamedBodyResponse (required for FULL_DUPLEX_STREAMED mode)
 		response := &ext_proc.ProcessingResponse{
 			Response: &ext_proc.ProcessingResponse_ResponseBody{
 				ResponseBody: &ext_proc.BodyResponse{
 					Response: &ext_proc.CommonResponse{
 						Status: ext_proc.CommonResponse_CONTINUE,
+						BodyMutation: &ext_proc.BodyMutation{
+							Mutation: &ext_proc.BodyMutation_StreamedResponse{
+								StreamedResponse: &ext_proc.StreamedBodyResponse{
+									Body:        originalResponseBody,
+									EndOfStream: endOfStream,
+								},
+							},
+						},
 					},
 				},
 			},
@@ -119,12 +174,17 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 
 	// Parse tokens from the response JSON using OpenAI SDK types
 	var parsed openai.ChatCompletion
+	var promptTokens, completionTokens int
 	if err := json.Unmarshal(responseBody, &parsed); err != nil {
-		logging.Errorf("Error parsing tokens from response: %v", err)
-		metrics.RecordRequestError(ctx.RequestModel, "parse_error")
+		// In FULL_DUPLEX_STREAMED mode, response body may arrive in chunks
+		// Incomplete JSON is expected on intermediate chunks - just log debug and continue
+		logging.Debugf("Could not parse response body as JSON (may be incomplete chunk in streaming mode): %v. Body: %s", err, string(responseBody))
+		// Note: tokens should have been recorded in a previous complete chunk if available
+		// so we don't record a parse_error here - it's expected for chunked responses
+	} else {
+		promptTokens = int(parsed.Usage.PromptTokens)
+		completionTokens = int(parsed.Usage.CompletionTokens)
 	}
-	promptTokens := int(parsed.Usage.PromptTokens)
-	completionTokens := int(parsed.Usage.CompletionTokens)
 
 	// Record tokens used with the model that was used
 	if ctx.RequestModel != "" {
@@ -225,14 +285,31 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 	var bodyMutation *ext_proc.BodyMutation
 	var headerMutation *ext_proc.HeaderMutation
 
-	// Set body mutation if response was transformed (Anthropic or Response API)
-	if anthropicTransformed || (ctx.ResponseAPICtx != nil && ctx.ResponseAPICtx.IsResponseAPIRequest) {
-		bodyMutation = &ext_proc.BodyMutation{
-			Mutation: &ext_proc.BodyMutation_Body{
-				Body: finalBody,
+	// Determine what body to forward to the client
+	// For transformed responses (Anthropic, Response API), use the transformed body
+	// For non-transformed responses, use the original chunk (not the reconstructed response)
+	bodyToForward := originalResponseBody
+	if anthropicTransformed {
+		// Anthropic transformation: forward the transformed full response
+		bodyToForward = responseBody
+	}
+	if ctx.ResponseAPICtx != nil && ctx.ResponseAPICtx.IsResponseAPIRequest {
+		// Response API translation: forward the translated body
+		bodyToForward = finalBody
+	}
+
+	// In FULL_DUPLEX_STREAMED mode, we must always use StreamedBodyResponse
+	// Always include body mutation to properly forward the response chunk
+	bodyMutation = &ext_proc.BodyMutation{
+		Mutation: &ext_proc.BodyMutation_StreamedResponse{
+			StreamedResponse: &ext_proc.StreamedBodyResponse{
+				Body:        bodyToForward,
+				EndOfStream: endOfStream,
 			},
-		}
-		// Remove content-length so Envoy recalculates it for the modified body
+		},
+	}
+	// Remove content-length for transformed responses so Envoy recalculates it
+	if anthropicTransformed || (ctx.ResponseAPICtx != nil && ctx.ResponseAPICtx.IsResponseAPIRequest) {
 		headerMutation = &ext_proc.HeaderMutation{
 			RemoveHeaders: []string{"content-length"},
 		}
@@ -285,12 +362,15 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 		}
 	}
 
-	// If body was modified, update the response with body mutation
+	// If body was modified, update the response with body mutation using StreamedBodyResponse
 	if needsBodyMutation {
 		bodyResponse := response.Response.(*ext_proc.ProcessingResponse_ResponseBody)
 		bodyResponse.ResponseBody.Response.BodyMutation = &ext_proc.BodyMutation{
-			Mutation: &ext_proc.BodyMutation_Body{
-				Body: modifiedBody,
+			Mutation: &ext_proc.BodyMutation_StreamedResponse{
+				StreamedResponse: &ext_proc.StreamedBodyResponse{
+					Body:        modifiedBody,
+					EndOfStream: endOfStream,
+				},
 			},
 		}
 	}
