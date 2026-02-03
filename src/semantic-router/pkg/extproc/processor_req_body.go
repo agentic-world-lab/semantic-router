@@ -331,7 +331,6 @@ func (r *OpenAIRouter) handleAnthropicRouting(openAIRequest *openai.ChatCompleti
 			RequestBody: &ext_proc.BodyResponse{
 				Response: &ext_proc.CommonResponse{
 					Status:          ext_proc.CommonResponse_CONTINUE,
-					ClearRouteCache: true,
 					HeaderMutation: &ext_proc.HeaderMutation{
 						SetHeaders:    setHeaders,
 						RemoveHeaders: anthropic.HeadersToRemove(),
@@ -377,13 +376,7 @@ func (r *OpenAIRouter) handleAutoModelRouting(openAIRequest *openai.ChatCompleti
 		// Create header mutation for routing
 		headerMutation := &ext_proc.HeaderMutation{}
 
-		// Set x-selected-model header for AgentGateway routing
-		headerMutation.SetHeaders = append(headerMutation.SetHeaders, &core.HeaderValueOption{
-			Header: &core.HeaderValue{
-				Key:      headers.VSRSelectedModel,
-				RawValue: []byte(matchedModel),
-			},
-		})
+
 
 		if selectedEndpoint != "" {
 			headerMutation.SetHeaders = append(headerMutation.SetHeaders, &core.HeaderValueOption{
@@ -450,11 +443,6 @@ func (r *OpenAIRouter) handleAutoModelRouting(openAIRequest *openai.ChatCompleti
 	// Log routing decision
 	r.logRoutingDecision(ctx, "auto_routing", originalModel, matchedModel, decisionName, reasoningDecision.UseReasoning, selectedEndpoint)
 
-	// Handle route cache clearing
-	if r.shouldClearRouteCache() {
-		r.setClearRouteCache(response)
-	}
-
 	// Save the actual model for token tracking
 	ctx.RequestModel = matchedModel
 
@@ -484,11 +472,6 @@ func (r *OpenAIRouter) handleSpecifiedModelRouting(openAIRequest *openai.ChatCom
 
 	// Create response with headers
 	response := r.createSpecifiedModelResponse(originalModel, selectedEndpoint, ctx)
-
-	// Handle route cache clearing
-	if r.shouldClearRouteCache() {
-		r.setClearRouteCache(response)
-	}
 
 	// Log routing decision
 	r.logRoutingDecision(ctx, "model_specified", originalModel, originalModel, "", false, selectedEndpoint)

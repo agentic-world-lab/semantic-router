@@ -28,7 +28,11 @@ func sendResponse(stream ext_proc.ExternalProcessor_ProcessServer, response *ext
 					logging.Infof("[RESPONSE-SEND]   Setting %d headers:", len(hm.SetHeaders))
 					for _, h := range hm.SetHeaders {
 						if h.Header != nil {
-							logging.Infof("[RESPONSE-SEND]     - %s: %s", h.Header.Key, h.Header.Value)
+							val := h.Header.Value
+							if val == "" && len(h.Header.RawValue) > 0 {
+								val = string(h.Header.RawValue)
+							}
+							logging.Infof("[RESPONSE-SEND]     - %s: %s", h.Header.Key, val)
 						}
 					}
 				}
@@ -65,7 +69,11 @@ func sendResponse(stream ext_proc.ExternalProcessor_ProcessServer, response *ext
 					logging.Infof("[RESPONSE-SEND]   Setting %d headers:", len(hm.SetHeaders))
 					for _, h := range hm.SetHeaders {
 						if h.Header != nil {
-							logging.Infof("[RESPONSE-SEND]     - %s: %s", h.Header.Key, h.Header.Value)
+							val := h.Header.Value
+							if val == "" && len(h.Header.RawValue) > 0 {
+								val = string(h.Header.RawValue)
+							}
+							logging.Infof("[RESPONSE-SEND]     - %s: %s", h.Header.Key, val)
 						}
 					}
 				}
@@ -85,7 +93,11 @@ func sendResponse(stream ext_proc.ExternalProcessor_ProcessServer, response *ext
 					logging.Infof("[RESPONSE-SEND]   Setting %d headers:", len(hm.SetHeaders))
 					for _, h := range hm.SetHeaders {
 						if h.Header != nil {
-							logging.Infof("[RESPONSE-SEND]     - %s: %s", h.Header.Key, h.Header.Value)
+							val := h.Header.Value
+							if val == "" && len(h.Header.RawValue) > 0 {
+								val = string(h.Header.RawValue)
+							}
+							logging.Infof("[RESPONSE-SEND]     - %s: %s", h.Header.Key, val)
 						}
 					}
 				}

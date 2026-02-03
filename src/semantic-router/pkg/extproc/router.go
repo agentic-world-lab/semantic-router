@@ -603,11 +603,7 @@ func (r *OpenAIRouter) createErrorResponse(statusCode int, message string) *ext_
 	return r.createJSONResponseWithBody(statusCode, jsonData)
 }
 
-// shouldClearRouteCache checks if route cache should be cleared
-func (r *OpenAIRouter) shouldClearRouteCache() bool {
-	// Check if feature is enabled
-	return r.Config.ClearRouteCache
-}
+
 
 // createResponseStore creates a response store based on configuration.
 func createResponseStore(cfg *config.RouterConfig) (responsestore.ResponseStore, error) {

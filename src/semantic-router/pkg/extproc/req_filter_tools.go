@@ -216,11 +216,7 @@ func (r *OpenAIRouter) updateRequestWithTools(openAIRequest *openai.ChatCompleti
 		BodyMutation:   bodyMutation,
 	}
 
-	// Check if route cache should be cleared
-	if r.shouldClearRouteCache() {
-		commonResponse.ClearRouteCache = true
-		logging.Debugf("Setting ClearRouteCache=true (feature enabled) in updateRequestWithTools")
-	}
+
 
 	// Update the response with body mutation and content-length removal
 	*response = &ext_proc.ProcessingResponse{

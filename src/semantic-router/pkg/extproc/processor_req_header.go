@@ -135,6 +135,10 @@ type RequestContext struct {
 	RAGBackend          string  // Backend used for retrieval ("milvus", "external_api", "mcp", "hybrid")
 	RAGSimilarityScore  float32 // Best similarity score from retrieval
 	RAGRetrievalLatency float64 // Retrieval latency in seconds
+
+	// ExtProc protocol state
+	DeferredHeaderResponse *ext_proc.ProcessingResponse // Deferred headers response to be sent after body processing
+	HeaderResponseSent     bool                         // Whether the headers response has been sent
 }
 
 // handleRequestHeaders processes the request headers
