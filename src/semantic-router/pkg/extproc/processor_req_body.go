@@ -164,9 +164,24 @@ func (r *OpenAIRouter) handleRequestBody(v *ext_proc.ProcessingRequest_RequestBo
 	ctx.UserContent = userContent
 
 	// Perform decision evaluation and model selection once at the beginning
-	// Use decision-based routing if decisions are configured, otherwise fall back to category-based
-	// This also evaluates fact-check signal as part of the signal evaluation
-	decisionName, classificationConfidence, reasoningDecision, selectedModel := r.performDecisionEvaluation(originalModel, userContent, nonUserMessages, ctx)
+	// Use decision-based routing
+	var decisionName string
+	var classificationConfidence float64
+	var reasoningDecision entropy.ReasoningDecision
+	var selectedModel string
+
+	if len(r.Config.Decisions) == 0 {
+		// If auto model name or empty model, use default
+		if r.Config.IsAutoModelName(originalModel) || originalModel == "" {
+			logging.Warnf("No decisions configured, using default model")
+			selectedModel = r.Config.DefaultModel
+		} else {
+			// No decisions configured, and not an auto model, so no routing
+			selectedModel = ""
+		}
+	} else {
+		decisionName, classificationConfidence, reasoningDecision, selectedModel = r.performDecisionEvaluation(originalModel, userContent, nonUserMessages, ctx)
+	}
 
 	// Record the initial request to this model (count all requests)
 	metrics.RecordModelRequest(selectedModel)
@@ -214,7 +229,7 @@ func (r *OpenAIRouter) handleModelRouting(openAIRequest *openai.ChatCompletionNe
 		},
 	}
 
-	isAutoModel := r.Config != nil && r.Config.IsAutoModelName(originalModel)
+	isAutoModel := r.Config != nil && (r.Config.IsAutoModelName(originalModel) || originalModel == "")
 
 	targetModel := originalModel
 	if isAutoModel && selectedModel != "" {
