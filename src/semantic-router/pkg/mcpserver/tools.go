@@ -164,12 +164,12 @@ func handleClassifyIntent(arguments map[string]interface{}) (*CallToolResponse, 
 
 	// Convert result to JSON
 	resultJSON, err := json.Marshal(map[string]interface{}{
-		"category":            result.Classification.Category,
-		"confidence":          result.Classification.Confidence,
-		"processing_time_ms":  result.Classification.ProcessingTimeMs,
-		"recommended_model":   result.RecommendedModel,
-		"routing_decision":    result.RoutingDecision,
-		"status":              "success",
+		"category":           result.Classification.Category,
+		"confidence":         result.Classification.Confidence,
+		"processing_time_ms": result.Classification.ProcessingTimeMs,
+		"recommended_model":  result.RecommendedModel,
+		"routing_decision":   result.RoutingDecision,
+		"status":             "success",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal result: %w", err)
@@ -223,12 +223,12 @@ func handleDetectPII(arguments map[string]interface{}) (*CallToolResponse, error
 
 	// Convert result to JSON
 	resultJSON, err := json.Marshal(map[string]interface{}{
-		"has_pii":                result.HasPII,
-		"entities":               result.Entities,
-		"masked_text":            result.MaskedText,
+		"has_pii":                 result.HasPII,
+		"entities":                result.Entities,
+		"masked_text":             result.MaskedText,
 		"security_recommendation": result.SecurityRecommendation,
-		"processing_time_ms":     result.ProcessingTimeMs,
-		"status":                 "success",
+		"processing_time_ms":      result.ProcessingTimeMs,
+		"status":                  "success",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal result: %w", err)
@@ -349,7 +349,7 @@ func handleRouteQuery(arguments map[string]interface{}) (*CallToolResponse, erro
 	if selectedModel == "" {
 		selectedModel = "default"
 	}
-	
+
 	// Use recommended model from classification if available
 	if result.RecommendedModel != "" {
 		selectedModel = result.RecommendedModel
@@ -357,12 +357,12 @@ func handleRouteQuery(arguments map[string]interface{}) (*CallToolResponse, erro
 
 	// Convert result to JSON with routing information
 	resultJSON, err := json.Marshal(map[string]interface{}{
-		"selected_model":      selectedModel,
-		"category":            result.Classification.Category,
-		"confidence":          result.Classification.Confidence,
-		"routing_decision":    result.RoutingDecision,
-		"processing_time_ms":  result.Classification.ProcessingTimeMs,
-		"status":              "success",
+		"selected_model":     selectedModel,
+		"category":           result.Classification.Category,
+		"confidence":         result.Classification.Confidence,
+		"routing_decision":   result.RoutingDecision,
+		"processing_time_ms": result.Classification.ProcessingTimeMs,
+		"status":             "success",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal result: %w", err)
@@ -434,6 +434,9 @@ func handleGetModels(arguments map[string]interface{}) (*CallToolResponse, error
 
 // handleCheckSemanticCache implements the check_semantic_cache tool
 func handleCheckSemanticCache(arguments map[string]interface{}) (*CallToolResponse, error) {
+	// TODO: In the future, this tool should perform actual cache lookups using the query parameter.
+	// For now, we validate the parameter but only return cache configuration information
+	// since direct cache access requires the cache instance which is not exposed to the MCP server.
 	_, ok := arguments["query"].(string)
 	if !ok {
 		return nil, fmt.Errorf("query parameter must be a string")
