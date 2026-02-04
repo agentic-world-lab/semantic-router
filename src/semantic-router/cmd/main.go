@@ -19,6 +19,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/extproc"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/k8s"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/logo"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/mcpserver"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modeldownload"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
@@ -37,6 +38,8 @@ func main() {
 		metricsPort           = flag.Int("metrics-port", 9190, "Port for Prometheus metrics")
 		enableAPI             = flag.Bool("enable-api", true, "Enable Classification API server")
 		enableSystemPromptAPI = flag.Bool("enable-system-prompt-api", false, "Enable system prompt configuration endpoints (SECURITY: only enable in trusted environments)")
+		enableMCP             = flag.Bool("enable-mcp", false, "Enable MCP (Model Context Protocol) server")
+		mcpPort               = flag.Int("mcp-port", 8090, "Port for MCP server")
 		secure                = flag.Bool("secure", false, "Enable secure gRPC server with TLS")
 		certPath              = flag.String("cert-path", "", "Path to TLS certificate directory (containing tls.crt and tls.key)")
 		kubeconfig            = flag.String("kubeconfig", "", "Path to kubeconfig file (optional, uses in-cluster config if not specified)")
@@ -269,6 +272,17 @@ func main() {
 			logging.Infof("Starting API server on port %d", *apiPort)
 			if err := apiserver.Init(*configPath, *apiPort, *enableSystemPromptAPI); err != nil {
 				logging.Errorf("Start API server error: %v", err)
+			}
+		}()
+	}
+
+	// Start MCP server if enabled
+	if *enableMCP {
+		go func() {
+			logging.Infof("Starting MCP server on port %d", *mcpPort)
+			if err := mcpserver.Init(*configPath, *mcpPort); err != nil {
+				logging.Errorf("Failed to start MCP server: %v", err)
+				os.Exit(1)
 			}
 		}()
 	}
