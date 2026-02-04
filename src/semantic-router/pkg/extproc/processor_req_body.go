@@ -2,6 +2,7 @@ package extproc
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -23,14 +24,85 @@ import (
 
 // handleRequestBody processes the request body
 func (r *OpenAIRouter) handleRequestBody(v *ext_proc.ProcessingRequest_RequestBody, ctx *RequestContext) (*ext_proc.ProcessingResponse, error) {
-	logging.Infof("Processing request body: %s", string(v.RequestBody.GetBody()))
+	logging.Infof("[REQ_BODY] ========== Starting Request Body Processing ==========")
+
+	// Defensive nil checks
+	if v == nil || v.RequestBody == nil {
+		logging.Infof("[REQ_BODY] Request body is nil, returning CONTINUE")
+		return &ext_proc.ProcessingResponse{
+			Response: &ext_proc.ProcessingResponse_RequestBody{
+				RequestBody: &ext_proc.BodyResponse{
+					Response: &ext_proc.CommonResponse{
+						Status: ext_proc.CommonResponse_CONTINUE,
+					},
+				},
+			},
+		}, nil
+	}
+
+	// If Envoy is sending request body in streamed mode it will send intermediate RequestBody messages
+	// with EndOfStream==false. Accumulate those and return CONTINUE. Only process when EndOfStream==true.
+	if !v.RequestBody.GetEndOfStream() {
+		logging.Infof("[REQ_BODY] * STREAMING REQUEST CHUNK * EndOfStream=false, accumulating chunk")
+		// Mark that we are receiving a streamed request
+		ctx.IsStreamingRequest = true
+		chunk := string(v.RequestBody.GetBody())
+		logging.Infof("[REQ_BODY] Chunk size: %d bytes", len(chunk))
+		if ctx.StreamingRequestChunks == nil {
+			ctx.StreamingRequestChunks = make([]string, 0)
+			ctx.StreamingRequestMetadata = make(map[string]interface{})
+			logging.Infof("[REQ_BODY] Initialized streaming request accumulation")
+		}
+		ctx.StreamingRequestChunks = append(ctx.StreamingRequestChunks, chunk)
+		logging.Infof("[REQ_BODY] Total chunks accumulated: %d", len(ctx.StreamingRequestChunks))
+
+		// Optionally parse partial chunk for early metadata (not doing heavy parsing here)
+		// Return CONTINUE so Envoy forwards the chunk upstream immediately.
+		return &ext_proc.ProcessingResponse{
+			Response: &ext_proc.ProcessingResponse_RequestBody{
+				RequestBody: &ext_proc.BodyResponse{
+					Response: &ext_proc.CommonResponse{
+						Status: ext_proc.CommonResponse_CONTINUE,
+					},
+				},
+			},
+		}, nil
+	}
+
+	// If we reached here, this is the final chunk (EndOfStream==true).
+	// Reconstruct the full request body either from accumulated chunks or from this chunk directly.
+	logging.Infof("[REQ_BODY] * FINAL REQUEST CHUNK * EndOfStream=true")
+	var requestBody []byte
+	if ctx.IsStreamingRequest && len(ctx.StreamingRequestChunks) > 0 {
+		// Append final chunk and join
+		finalChunk := string(v.RequestBody.GetBody())
+		logging.Infof("[REQ_BODY] Final chunk size: %d bytes", len(finalChunk))
+		ctx.StreamingRequestChunks = append(ctx.StreamingRequestChunks, finalChunk)
+		ctx.StreamingRequestContent = strings.Join(ctx.StreamingRequestChunks, "")
+		requestBody = []byte(ctx.StreamingRequestContent)
+		ctx.StreamingRequestComplete = true
+		logging.Infof("[REQ_BODY] Reconstructed full request body from %d chunks, total size: %d bytes",
+			len(ctx.StreamingRequestChunks), len(requestBody))
+	} else {
+		// Not streamed or no previous chunks: use this body directly
+		requestBody = v.RequestBody.GetBody()
+		logging.Infof("[REQ_BODY] Using non-streamed request body directly, size: %d bytes", len(requestBody))
+		// clear any streaming flags
+		ctx.IsStreamingRequest = false
+		ctx.StreamingRequestChunks = nil
+		ctx.StreamingRequestContent = ""
+		ctx.StreamingRequestComplete = false
+	}
+
+	logging.Infof("[REQ_BODY] Processing request body: %s", string(requestBody))
 	// Record start time for model routing
 	ctx.ProcessingStartTime = time.Now()
+	logging.Infof("[REQ_BODY] Processing start time recorded: %v", ctx.ProcessingStartTime)
 	// Save the original request body
-	ctx.OriginalRequestBody = v.RequestBody.GetBody()
+	ctx.OriginalRequestBody = requestBody
 
 	// Handle Response API translation if this is a /v1/responses request
-	requestBody := ctx.OriginalRequestBody
+	requestBody = ctx.OriginalRequestBody
 	if ctx.ResponseAPICtx != nil && ctx.ResponseAPICtx.IsResponseAPIRequest && r.ResponseAPIFilter != nil {
 		respCtx, translatedBody, err := r.ResponseAPIFilter.TranslateRequest(ctx.TraceContext, requestBody)
 		if err != nil {
@@ -76,13 +148,11 @@ func (r *OpenAIRouter) handleRequestBody(v *ext_proc.ProcessingRequest_RequestBo
 		ctx.RequestModel = originalModel
 	}
 
-	// Check if this is a looper internal request - if so, skip all plugin processing
-	// and route directly to the specified model (looper already did decision evaluation)
+	// Check if this is a looper internal request - if so, execute decision plugins
+	// (lookup decision by name and apply configured plugins)
 	if r.isLooperRequest(ctx) {
-		logging.Infof("[Looper] Internal request detected, skipping plugin processing, routing to model: %s", originalModel)
-		ctx.RequestModel = originalModel
-		ctx.VSRSelectedModel = originalModel
-		return r.handleLooperInternalRequest(originalModel, ctx)
+		logging.Infof("[Looper] Internal request detected, executing decision plugins for model: %s", originalModel)
+		return r.handleLooperInternalRequestWithPlugins(originalModel, ctx)
 	}
 
 	// Get content from messages
@@ -92,9 +162,24 @@ func (r *OpenAIRouter) handleRequestBody(v *ext_proc.ProcessingRequest_RequestBo
 	ctx.UserContent = userContent
 
 	// Perform decision evaluation and model selection once at the beginning
-	// Use decision-based routing if decisions are configured, otherwise fall back to category-based
-	// This also evaluates fact-check signal as part of the signal evaluation
-	decisionName, classificationConfidence, reasoningDecision, selectedModel := r.performDecisionEvaluation(originalModel, userContent, nonUserMessages, ctx)
+	// Use decision-based routing
+	var decisionName string
+	var classificationConfidence float64
+	var reasoningDecision entropy.ReasoningDecision
+	var selectedModel string
+
+	if len(r.Config.Decisions) == 0 {
+		// If auto model name or empty model, use default
+		if r.Config.IsAutoModelName(originalModel) || originalModel == "" {
+			logging.Warnf("No decisions configured, using default model")
+			selectedModel = r.Config.DefaultModel
+		} else {
+			// No decisions configured, and not an auto model, so no routing
+			selectedModel = ""
+		}
+	} else {
+		decisionName, classificationConfidence, reasoningDecision, selectedModel = r.performDecisionEvaluation(originalModel, userContent, nonUserMessages, ctx)
+	}
 
 	// Record the initial request to this model (count all requests)
 	metrics.RecordModelRequest(selectedModel)
@@ -148,7 +233,7 @@ func (r *OpenAIRouter) handleModelRouting(openAIRequest *openai.ChatCompletionNe
 		},
 	}
 
-	isAutoModel := r.Config != nil && r.Config.IsAutoModelName(originalModel)
+	isAutoModel := r.Config != nil && (r.Config.IsAutoModelName(originalModel) || originalModel == "")
 
 	targetModel := originalModel
 	if isAutoModel && selectedModel != "" {
@@ -245,21 +330,31 @@ func (r *OpenAIRouter) handleAnthropicRouting(openAIRequest *openai.ChatCompleti
 
 	// Return response with body and header mutations - let Envoy route to Anthropic
 	// ClearRouteCache forces Envoy to re-evaluate routing after we set x-selected-model header
+	// Use StreamedBodyResponse for streaming mode (FULL_DUPLEX_STREAMED), Body for non-streaming
+	bodyMutation := &ext_proc.BodyMutation{}
+	if ctx.IsStreamingRequest {
+		bodyMutation.Mutation = &ext_proc.BodyMutation_StreamedResponse{
+			StreamedResponse: &ext_proc.StreamedBodyResponse{
+				Body:        anthropicBody,
+				EndOfStream: true,
+			},
+		}
+	} else {
+		bodyMutation.Mutation = &ext_proc.BodyMutation_Body{
+			Body: anthropicBody,
+		}
+	}
+
 	return &ext_proc.ProcessingResponse{
 		Response: &ext_proc.ProcessingResponse_RequestBody{
 			RequestBody: &ext_proc.BodyResponse{
 				Response: &ext_proc.CommonResponse{
 					Status:          ext_proc.CommonResponse_CONTINUE,
-					ClearRouteCache: true,
 					HeaderMutation: &ext_proc.HeaderMutation{
 						SetHeaders:    setHeaders,
 						RemoveHeaders: anthropic.HeadersToRemove(),
 					},
-					BodyMutation: &ext_proc.BodyMutation{
-						Mutation: &ext_proc.BodyMutation_Body{
-							Body: anthropicBody,
-						},
-					},
+					BodyMutation: bodyMutation,
 				},
 			},
 		},
@@ -292,6 +387,69 @@ func (r *OpenAIRouter) handleAutoModelRouting(openAIRequest *openai.ChatCompleti
 	// Select endpoint for the matched model
 	selectedEndpoint := r.selectEndpointForModel(ctx, matchedModel)
 
+	// For streaming requests (FULL_DUPLEX_STREAMED mode), use header + body routing
+	// Set header for routing AND update request body with selected model
+	if ctx.IsStreamingRequest {
+		logging.Infof("[AUTO_ROUTING] *** STREAMING MODE *** Using header+body routing for model: %s", matchedModel)
+
+		// Create header mutation for routing
+		headerMutation := &ext_proc.HeaderMutation{}
+
+
+
+		if selectedEndpoint != "" {
+			headerMutation.SetHeaders = append(headerMutation.SetHeaders, &core.HeaderValueOption{
+				Header: &core.HeaderValue{
+					Key:      "x-selected-endpoint",
+					RawValue: []byte(selectedEndpoint),
+				},
+			})
+		}
+
+		// Also update the request body to replace the model field with the selected model
+		// This ensures AgentGateway backends receive the correct model in the request
+		logging.Infof("[AUTO_ROUTING] Updating request body model field from '%s' to '%s'", originalModel, matchedModel)
+		modifiedBody, err := rewriteRequestModel(ctx.OriginalRequestBody, matchedModel)
+		if err != nil {
+			logging.Errorf("[AUTO_ROUTING] Failed to rewrite model in request body: %v", err)
+			// Continue without body modification if rewrite fails
+			modifiedBody = ctx.OriginalRequestBody
+		}
+
+		response = &ext_proc.ProcessingResponse{
+			Response: &ext_proc.ProcessingResponse_RequestBody{
+				RequestBody: &ext_proc.BodyResponse{
+					Response: &ext_proc.CommonResponse{
+						Status:         ext_proc.CommonResponse_CONTINUE,
+						HeaderMutation: headerMutation,
+						BodyMutation: &ext_proc.BodyMutation{
+							Mutation: &ext_proc.BodyMutation_StreamedResponse{
+								StreamedResponse: &ext_proc.StreamedBodyResponse{
+									Body:        modifiedBody,
+									EndOfStream: true,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		// Save the actual model for token tracking
+		ctx.RequestModel = matchedModel
+
+		// Log routing decision
+		r.logRoutingDecision(ctx, "auto_routing", originalModel, matchedModel, decisionName, reasoningDecision.UseReasoning, selectedEndpoint)
+
+		// Record routing latency
+		r.recordRoutingLatency(ctx)
+
+		return response, nil
+	}
+
+	// Non-streaming mode: Use body mutations (traditional Envoy-based routing)
+	logging.Infof("[AUTO_ROUTING] Using traditional body mutation routing for non-streaming request")
+
 	// Modify request body with new model, reasoning mode, and system prompt
 	modifiedBody, err := r.modifyRequestBodyForAutoRouting(openAIRequest, matchedModel, decisionName, reasoningDecision.UseReasoning, ctx)
 	if err != nil {
@@ -303,11 +461,6 @@ func (r *OpenAIRouter) handleAutoModelRouting(openAIRequest *openai.ChatCompleti
 
 	// Log routing decision
 	r.logRoutingDecision(ctx, "auto_routing", originalModel, matchedModel, decisionName, reasoningDecision.UseReasoning, selectedEndpoint)
-
-	// Handle route cache clearing
-	if r.shouldClearRouteCache() {
-		r.setClearRouteCache(response)
-	}
 
 	// Save the actual model for token tracking
 	ctx.RequestModel = matchedModel
@@ -338,11 +491,6 @@ func (r *OpenAIRouter) handleSpecifiedModelRouting(openAIRequest *openai.ChatCom
 
 	// Create response with headers
 	response := r.createSpecifiedModelResponse(originalModel, selectedEndpoint, ctx)
-
-	// Handle route cache clearing
-	if r.shouldClearRouteCache() {
-		r.setClearRouteCache(response)
-	}
 
 	// Log routing decision
 	r.logRoutingDecision(ctx, "model_specified", originalModel, originalModel, "", false, selectedEndpoint)
@@ -441,10 +589,19 @@ func (r *OpenAIRouter) startUpstreamSpanAndInjectHeaders(model string, endpoint 
 
 // createRoutingResponse creates a routing response with mutations
 func (r *OpenAIRouter) createRoutingResponse(model string, endpoint string, modifiedBody []byte, ctx *RequestContext) *ext_proc.ProcessingResponse {
-	bodyMutation := &ext_proc.BodyMutation{
-		Mutation: &ext_proc.BodyMutation_Body{
+	// Use StreamedBodyResponse for streaming mode (FULL_DUPLEX_STREAMED), Body for non-streaming
+	bodyMutation := &ext_proc.BodyMutation{}
+	if ctx.IsStreamingRequest {
+		bodyMutation.Mutation = &ext_proc.BodyMutation_StreamedResponse{
+			StreamedResponse: &ext_proc.StreamedBodyResponse{
+				Body:        modifiedBody,
+				EndOfStream: true,
+			},
+		}
+	} else {
+		bodyMutation.Mutation = &ext_proc.BodyMutation_Body{
 			Body: modifiedBody,
-		},
+		}
 	}
 
 	setHeaders := []*core.HeaderValueOption{}
@@ -586,10 +743,22 @@ func (r *OpenAIRouter) createSpecifiedModelResponse(model string, endpoint strin
 
 		// Use the translated body from Response API context
 		if len(ctx.ResponseAPICtx.TranslatedBody) > 0 {
-			bodyMutation = &ext_proc.BodyMutation{
-				Mutation: &ext_proc.BodyMutation_Body{
-					Body: ctx.ResponseAPICtx.TranslatedBody,
-				},
+			// Use StreamedBodyResponse for streaming mode (FULL_DUPLEX_STREAMED), Body for non-streaming
+			if ctx.IsStreamingRequest {
+				bodyMutation = &ext_proc.BodyMutation{
+					Mutation: &ext_proc.BodyMutation_StreamedResponse{
+						StreamedResponse: &ext_proc.StreamedBodyResponse{
+							Body:        ctx.ResponseAPICtx.TranslatedBody,
+							EndOfStream: true,
+						},
+					},
+				}
+			} else {
+				bodyMutation = &ext_proc.BodyMutation{
+					Mutation: &ext_proc.BodyMutation_Body{
+						Body: ctx.ResponseAPICtx.TranslatedBody,
+					},
+				}
 			}
 		}
 		logging.Infof("Response API: Rewriting path to /v1/chat/completions (specified model)")
