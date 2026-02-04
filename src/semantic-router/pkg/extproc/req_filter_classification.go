@@ -31,7 +31,7 @@ func (r *OpenAIRouter) performDecisionEvaluation(originalModel string, userConte
 
 	// Check if decisions are configured
 	if len(r.Config.Decisions) == 0 {
-		if r.Config.IsAutoModelName(originalModel) {
+		if r.Config.IsAutoModelName(originalModel) || originalModel == "" {
 			logging.Warnf("No decisions configured, using default model")
 			return "", 0.0, entropy.ReasoningDecision{}, r.Config.DefaultModel
 		}
@@ -133,7 +133,7 @@ func (r *OpenAIRouter) performDecisionEvaluation(originalModel string, userConte
 		// End decision span with error
 		tracing.EndDecisionSpan(decisionSpan, 0.0, []string{}, r.Config.Strategy)
 		ctx.TraceContext = decisionCtx
-		if r.Config.IsAutoModelName(originalModel) {
+		if r.Config.IsAutoModelName(originalModel) || originalModel == "" {
 			return "", 0.0, entropy.ReasoningDecision{}, r.Config.DefaultModel
 		}
 		return "", 0.0, entropy.ReasoningDecision{}, ""
@@ -143,7 +143,7 @@ func (r *OpenAIRouter) performDecisionEvaluation(originalModel string, userConte
 		// End decision span with no match
 		tracing.EndDecisionSpan(decisionSpan, 0.0, []string{}, r.Config.Strategy)
 		ctx.TraceContext = decisionCtx
-		if r.Config.IsAutoModelName(originalModel) {
+		if r.Config.IsAutoModelName(originalModel) || originalModel == "" {
 			return "", 0.0, entropy.ReasoningDecision{}, r.Config.DefaultModel
 		}
 		return "", 0.0, entropy.ReasoningDecision{}, ""
@@ -190,7 +190,7 @@ func (r *OpenAIRouter) performDecisionEvaluation(originalModel string, userConte
 
 	// Model selection only happens for auto models
 	// When a specific model is requested, we keep it but still apply decision plugins
-	if !r.Config.IsAutoModelName(originalModel) {
+	if !r.Config.IsAutoModelName(originalModel) && originalModel != "" {
 		logging.Infof("Model %s explicitly specified, keeping original model (decision %s plugins will be applied)",
 			originalModel, decisionName)
 		return decisionName, evaluationConfidence, reasoningDecision, ""

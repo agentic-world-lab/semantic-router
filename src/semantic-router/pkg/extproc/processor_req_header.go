@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -48,12 +49,23 @@ type RequestContext struct {
 	ExpectStreamingResponse bool // set from request Accept header or stream parameter
 	IsStreamingResponse     bool // set from response Content-Type
 
-	// Streaming accumulation for caching
+	// Streaming accumulation for caching (responses)
 	StreamingChunks   []string               // Accumulated SSE chunks
 	StreamingContent  string                 // Accumulated content from delta.content
 	StreamingMetadata map[string]interface{} // id, model, created from first chunk
 	StreamingComplete bool                   // True when [DONE] marker received
 	StreamingAborted  bool                   // True if stream ended abnormally (EOF, cancel, timeout)
+
+	// Streaming accumulation for request bodies (additions to support streamed request body)
+	IsStreamingRequest       bool                   // True when Envoy sends partial RequestBody messages
+	StreamingRequestChunks   []string               // Accumulated request body chunks
+	StreamingRequestContent  string                 // Reconstructed request body (after final chunk)
+	StreamingRequestMetadata map[string]interface{} // optional metadata extracted from request chunks
+	StreamingRequestComplete bool                   // True after EndOfStream received
+	StreamingRequestAborted  bool                   // True if request streaming aborted
+
+	// Streaming accumulation for response bodies (additions to support streamed response body)
+	StreamingResponseChunks [][]byte // Accumulated response body chunks from Envoy STREAMED mode
 
 	// TTFT tracking
 	TTFTRecorded bool
@@ -133,6 +145,10 @@ type RequestContext struct {
 	RAGBackend          string  // Backend used for retrieval ("milvus", "external_api", "mcp", "hybrid")
 	RAGSimilarityScore  float32 // Best similarity score from retrieval
 	RAGRetrievalLatency float64 // Retrieval latency in seconds
+
+	// ExtProc protocol state
+	DeferredHeaderResponse *ext_proc.ProcessingResponse // Deferred headers response to be sent after body processing
+	HeaderResponseSent     bool                         // Whether the headers response has been sent
 }
 
 // handleRequestHeaders processes the request headers
@@ -248,13 +264,30 @@ func (r *OpenAIRouter) handleRequestHeaders(v *ext_proc.ProcessingRequest_Reques
 		}
 	}
 
-	// Prepare base response
+	// Prepare base response with default model header for routing
+	// The HTTPRoute in AgentGateway needs this header to match rules BEFORE ext_proc processing
+	// This header will be updated in RequestBody phase after we determine the actual selected model
+	headerMutation := &ext_proc.HeaderMutation{}
+
+	defaultModel := r.Config.DefaultModel
+	if defaultModel == "" {
+		defaultModel = "llama-3.1-8b-instruct"  // Fallback default
+	}
+	logging.Infof("[REQ_HEADERS] Setting default model header for routing: %s", defaultModel)
+
+	headerMutation.SetHeaders = append(headerMutation.SetHeaders, &core.HeaderValueOption{
+		Header: &core.HeaderValue{
+			Key:      headers.VSRSelectedModel,
+			RawValue: []byte(defaultModel),
+		},
+	})
+
 	response := &ext_proc.ProcessingResponse{
 		Response: &ext_proc.ProcessingResponse_RequestHeaders{
 			RequestHeaders: &ext_proc.HeadersResponse{
 				Response: &ext_proc.CommonResponse{
-					Status: ext_proc.CommonResponse_CONTINUE,
-					// No HeaderMutation - will be handled in body phase
+					Status:         ext_proc.CommonResponse_CONTINUE,
+					HeaderMutation: headerMutation,
 				},
 			},
 		},
